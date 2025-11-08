@@ -141,30 +141,139 @@ def upload_to_dropbox(file_path, file_name):
         return None
 
 def search_youtube(query):
-    """YouTubeで曲を検索"""
+    """改善版YouTube検索"""
     try:
+        # 検索クエリを強化
+        enhanced_query = f"{query} 音楽"
+        print(f"🔍 検索クエリ: {enhanced_query}")
+        
         cmd = [
             'yt-dlp',
-            f"ytsearch1:{query}",
+            f"ytsearch3:{enhanced_query}",  # 3件検索
             '--dump-json',
             '--no-warnings',
-            '--quiet'
+            '--quiet',
+            '--match-filter', "duration < 600"  # 10分以内の動画のみ
         ]
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         
-        if result.stdout.strip():
-            data = json.loads(result.stdout)
-            return {
-                'title': data.get('title', ''),
-                'url': data.get('webpage_url', ''),
-                'duration': data.get('duration', 0),
-                'uploader': data.get('uploader', '')
-            }
+        videos = []
+        for line in result.stdout.strip().split('\n'):
+            if line:
+                try:
+                    data = json.loads(line)
+                    video_info = {
+                        'title': data.get('title', ''),
+                        'url': data.get('webpage_url', ''),
+                        'duration': data.get('duration', 0),
+                        'uploader': data.get('uploader', ''),
+                        'view_count': data.get('view_count', 0)
+                    }
+                    
+                    # 音楽らしい動画を優先
+                    score = calculate_music_score(video_info)
+                    video_info['score'] = score
+                    videos.append(video_info)
+                    
+                    print(f"🎵 検索結果: {video_info['title']} (スコア: {score})")
+                    
+                except Exception as e:
+                    print(f"解析エラー: {e}")
+                    continue
+        
+        # スコアが高い順にソート
+        if videos:
+            videos.sort(key=lambda x: x['score'], reverse=True)
+            best_video = videos[0]
+            print(f"✅ 最適な動画を選択: {best_video['title']}")
+            return best_video
+        
+        print("❌ 検索結果が見つかりませんでした")
         return None
+        
     except Exception as e:
         print(f"検索エラー: {e}")
         return None
+
+def calculate_music_score(video_info):
+    """音楽動画らしさをスコアリング"""
+    score = 0
+    title = video_info['title'].lower()
+    duration = video_info['duration']
+    uploader = video_info['uploader'].lower()
+    
+    # タイトルに音楽関連キーワードがあるか
+    music_keywords = [
+        'official', 'mv', 'music', 'audio', 'full',
+        'lyric', 'lyrics', '歌ってみた', 'カバー'
+    ]
+    
+    for keyword in music_keywords:
+        if keyword in title:
+            score += 2
+    
+    # 適切な長さか（2分〜8分）
+    if 120 <= duration <= 480:  # 2-8分
+        score += 3
+    elif 60 <= duration <= 600:  # 1-10分
+        score += 1
+    
+    # アーティスト名らしいか
+    artist_keywords = ['topic', 'vevo', 'records', 'music']
+    if any(keyword in uploader for keyword in artist_keywords):
+        score += 1
+    
+    # 閲覧数が多いほど高スコア
+    view_count = video_info.get('view_count', 0)
+    if view_count > 1000000:  # 100万回以上
+        score += 2
+    elif view_count > 100000:  # 10万回以上
+        score += 1
+    
+    return score
+
+def search_and_process(user_id, song_name):
+    """改善版検索処理"""
+    try:
+        line_bot_api.push_message(user_id, TextSendMessage(text="🔍 最適な曲を検索中..."))
+        
+        # YouTube検索
+        video_info = search_youtube(song_name)
+        if not video_info:
+            line_bot_api.push_message(
+                user_id, 
+                TextSendMessage(text="❌ 曲が見つかりませんでした\n別のキーワードでお試しください")
+            )
+            return
+        
+        # 動画情報を表示
+        duration = video_info['duration']
+        mins, secs = divmod(duration, 60)
+        
+        message = f"""✅ 見つかりました！
+
+🎵 タイトル: {video_info['title']}
+👤 アーティスト: {video_info['uploader']}
+⏱ 長さ: {mins}分{secs}秒
+👁 閲覧数: {video_info.get('view_count', 0):,}回
+
+🔗 {video_info['url']}"""
+
+        line_bot_api.push_message(user_id, TextSendMessage(text=message))
+        
+        # MP3ダウンロードオプションを提供
+        line_bot_api.push_message(
+            user_id,
+            TextSendMessage(text="📥 この曲をMP3でダウンロードしますか？\n（現在準備中）")
+        )
+        
+    except Exception as e:
+        print(f"処理エラー: {e}")
+        line_bot_api.push_message(
+            user_id,
+            TextSendMessage(text="😢 エラーが発生しました")
+        )
 
 def download_audio(video_url):
     """YouTubeから音声をダウンロード"""
@@ -273,3 +382,4 @@ if __name__ == "__main__":
     print(f"✅ LINE_TOKEN: {'設定済み' if LINE_CHANNEL_ACCESS_TOKEN else '未設定'}")
     print(f"✅ DROPBOX_TOKEN: {'設定済み' if DROPBOX_ACCESS_TOKEN else '未設定'}")
     app.run(host='0.0.0.0', port=port)
+
