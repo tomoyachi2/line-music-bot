@@ -1,385 +1,248 @@
 import os
-import json
 import tempfile
-import subprocess
 import threading
-from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
-import dropbox
-from dropbox.exceptions import AuthError
+import logging
+from datetime import datetime
+from flask import Flask, request, jsonify
+import yt_dlp
+from urllib.parse import quote
+
+# ログ設定
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# 環境変数の設定
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
-LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
-DROPBOX_ACCESS_TOKEN = os.environ.get('DROPBOX_ACCESS_TOKEN')
+# インメモリストレージ（本番ではデータベースを使用）
+jobs_db = {}
 
-# 環境変数チェック
-if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET]):
-    print("❌ LINEの環境変数が設定されていません")
-if not DROPBOX_ACCESS_TOKEN:
-    print("❌ Dropboxの環境変数が設定されていません")
-
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-# ユーザーの状態管理
-user_states = {}
-
-@app.route("/", methods=['GET'])
+@app.route('/')
 def home():
-    return "🎵 LINE Music Bot が動作中です！Dropbox連携済み"
+    return jsonify({
+        "status": "MP3 Converter API is running!",
+        "timestamp": datetime.now().isoformat(),
+        "endpoints": {
+            "convert": "POST /api/convert",
+            "status": "GET /api/status/<job_id>",
+            "health": "GET /health"
+        }
+    })
 
-@app.route("/callback", methods=['POST'])
-def callback():
-    signature = request.headers['X-Line-Signature']
-    body = request.get_data(as_text=True)
-    print("📨 メッセージを受信")
-
+@app.route('/api/convert', methods=['POST'])
+def convert_mp3():
     try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-    return 'OK'
-
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    user_id = event.source.user_id
-    message_text = event.message.text.strip()
-    
-    print(f"👤 {user_id}: {message_text}")
-    
-    if message_text == "テスト":
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="✅ ボットは正常に動作しています！Dropbox連携OK")
+        data = request.get_json()
+        
+        # 必須フィールドの検証
+        required_fields = ['songName', 'videoUrl', 'userEmail']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({
+                    "success": False,
+                    "error": f"Missing required field: {field}"
+                }), 400
+        
+        song_name = data['songName']
+        video_url = data['videoUrl']
+        user_email = data['userEmail']
+        
+        logger.info(f"変換リクエスト受信: {song_name} - {user_email}")
+        
+        # ジョブIDを生成
+        job_id = generate_job_id(song_name)
+        
+        # ジョブ情報を保存
+        jobs_db[job_id] = {
+            "status": "processing",
+            "song_name": song_name,
+            "user_email": user_email,
+            "video_url": video_url,
+            "created_at": datetime.now().isoformat(),
+            "progress": "開始待機中"
+        }
+        
+        # 非同期で変換を開始
+        thread = threading.Thread(
+            target=process_conversion,
+            args=(job_id, song_name, video_url, user_email),
+            daemon=True
         )
-    
-    elif message_text == "使い方":
-        show_usage(event.reply_token)
-    
-    elif message_text == "曲をダウンロード":
-        user_states[user_id] = 'waiting_song_name'
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="🎵 曲名を入力してください\n例: Lemon 米津玄師")
-        )
-    
-    elif user_states.get(user_id) == 'waiting_song_name':
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=f"🔍 「{message_text}」を検索中...")
-        )
-        threading.Thread(
-            target=search_and_process,
-            args=(user_id, message_text)
-        ).start()
-        user_states[user_id] = None
-    
-    else:
-        show_usage(event.reply_token)
-
-def show_usage(reply_token):
-    usage_text = """🎵 LINE音楽ダウンローダー
-
-【使い方】
-• 「テスト」: 接続確認
-• 「曲をダウンロード」: MP3をダウンロード
-• 「使い方」: この説明
-
-※ MP3はDropboxに保存され、ダウンロードリンクが送信されます"""
-    
-    line_bot_api.reply_message(
-        reply_token,
-        TextSendMessage(text=usage_text)
-    )
-
-def get_dropbox_client():
-    """Dropboxクライアントを取得"""
-    try:
-        if not DROPBOX_ACCESS_TOKEN:
-            return None
-        return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
-    except Exception as e:
-        print(f"Dropbox接続エラー: {e}")
-        return None
-
-def upload_to_dropbox(file_path, file_name):
-    """Dropboxにアップロードして共有リンクを生成"""
-    try:
-        dbx = get_dropbox_client()
-        if not dbx:
-            return None
+        thread.start()
         
-        # ファイル名を安全な形式に
-        safe_name = "".join(c for c in file_name if c.isalnum() or c in (' ', '-', '_', '.')).rstrip()
-        safe_name = safe_name[:100]  # 長すぎる名前を制限
+        logger.info(f"ジョブ開始: {job_id}")
         
-        # Dropboxにアップロード
-        with open(file_path, 'rb') as f:
-            result = dbx.files_upload(
-                f.read(),
-                f'/{safe_name}',
-                mode=dropbox.files.WriteMode.overwrite
-            )
-        
-        print(f"✅ Dropboxアップロード成功: {safe_name}")
-        
-        # 共有リンクを作成
-        shared_link = dbx.sharing_create_shared_link(result.path_display)
-        print(f"🔗 共有リンク: {shared_link.url}")
-        return shared_link.url
-        
-    except AuthError as e:
-        print(f"Dropbox認証エラー: {e}")
-        return None
-    except Exception as e:
-        print(f"Dropboxアップロードエラー: {e}")
-        return None
-
-def search_youtube(query):
-    """改善版YouTube検索"""
-    try:
-        # 検索クエリを強化
-        enhanced_query = f"{query} 音楽"
-        print(f"🔍 検索クエリ: {enhanced_query}")
-        
-        cmd = [
-            'yt-dlp',
-            f"ytsearch3:{enhanced_query}",  # 3件検索
-            '--dump-json',
-            '--no-warnings',
-            '--quiet',
-            '--match-filter', "duration < 600"  # 10分以内の動画のみ
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        videos = []
-        for line in result.stdout.strip().split('\n'):
-            if line:
-                try:
-                    data = json.loads(line)
-                    video_info = {
-                        'title': data.get('title', ''),
-                        'url': data.get('webpage_url', ''),
-                        'duration': data.get('duration', 0),
-                        'uploader': data.get('uploader', ''),
-                        'view_count': data.get('view_count', 0)
-                    }
-                    
-                    # 音楽らしい動画を優先
-                    score = calculate_music_score(video_info)
-                    video_info['score'] = score
-                    videos.append(video_info)
-                    
-                    print(f"🎵 検索結果: {video_info['title']} (スコア: {score})")
-                    
-                except Exception as e:
-                    print(f"解析エラー: {e}")
-                    continue
-        
-        # スコアが高い順にソート
-        if videos:
-            videos.sort(key=lambda x: x['score'], reverse=True)
-            best_video = videos[0]
-            print(f"✅ 最適な動画を選択: {best_video['title']}")
-            return best_video
-        
-        print("❌ 検索結果が見つかりませんでした")
-        return None
+        return jsonify({
+            "success": True,
+            "jobId": job_id,
+            "status": "processing",
+            "message": "MP3変換を開始しました",
+            "estimatedTime": "2-5分"
+        })
         
     except Exception as e:
-        print(f"検索エラー: {e}")
-        return None
+        logger.error(f"変換エラー: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": f"内部サーバーエラー: {str(e)}"
+        }), 500
 
-def calculate_music_score(video_info):
-    """音楽動画らしさをスコアリング"""
-    score = 0
-    title = video_info['title'].lower()
-    duration = video_info['duration']
-    uploader = video_info['uploader'].lower()
-    
-    # タイトルに音楽関連キーワードがあるか
-    music_keywords = [
-        'official', 'mv', 'music', 'audio', 'full',
-        'lyric', 'lyrics', '歌ってみた', 'カバー'
-    ]
-    
-    for keyword in music_keywords:
-        if keyword in title:
-            score += 2
-    
-    # 適切な長さか（2分〜8分）
-    if 120 <= duration <= 480:  # 2-8分
-        score += 3
-    elif 60 <= duration <= 600:  # 1-10分
-        score += 1
-    
-    # アーティスト名らしいか
-    artist_keywords = ['topic', 'vevo', 'records', 'music']
-    if any(keyword in uploader for keyword in artist_keywords):
-        score += 1
-    
-    # 閲覧数が多いほど高スコア
-    view_count = video_info.get('view_count', 0)
-    if view_count > 1000000:  # 100万回以上
-        score += 2
-    elif view_count > 100000:  # 10万回以上
-        score += 1
-    
-    return score
-
-def search_and_process(user_id, song_name):
-    """改善版検索処理"""
+def process_conversion(job_id, song_name, video_url, user_email):
+    """非同期でMP3変換を処理"""
     try:
-        line_bot_api.push_message(user_id, TextSendMessage(text="🔍 最適な曲を検索中..."))
+        # ジョブステータスを更新
+        jobs_db[job_id].update({
+            "status": "downloading",
+            "progress": "YouTubeからダウンロード中",
+            "started_at": datetime.now().isoformat()
+        })
         
-        # YouTube検索
-        video_info = search_youtube(song_name)
-        if not video_info:
-            line_bot_api.push_message(
-                user_id, 
-                TextSendMessage(text="❌ 曲が見つかりませんでした\n別のキーワードでお試しください")
-            )
-            return
-        
-        # 動画情報を表示
-        duration = video_info['duration']
-        mins, secs = divmod(duration, 60)
-        
-        message = f"""✅ 見つかりました！
-
-🎵 タイトル: {video_info['title']}
-👤 アーティスト: {video_info['uploader']}
-⏱ 長さ: {mins}分{secs}秒
-👁 閲覧数: {video_info.get('view_count', 0):,}回
-
-🔗 {video_info['url']}"""
-
-        line_bot_api.push_message(user_id, TextSendMessage(text=message))
-        
-        # MP3ダウンロードオプションを提供
-        line_bot_api.push_message(
-            user_id,
-            TextSendMessage(text="📥 この曲をMP3でダウンロードしますか？\n（現在準備中）")
-        )
-        
-    except Exception as e:
-        print(f"処理エラー: {e}")
-        line_bot_api.push_message(
-            user_id,
-            TextSendMessage(text="😢 エラーが発生しました")
-        )
-
-def download_audio(video_url):
-    """YouTubeから音声をダウンロード"""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
-            output_template = tmp_file.name.replace('.mp3', '.%(ext)s')
-        
-        cmd = [
-            'yt-dlp',
-            '-x',
-            '--audio-format', 'mp3',
-            '--audio-quality', '0',
-            '--no-overwrites',
-            '--quiet',
-            '-o', output_template,
-            video_url
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
-        if result.returncode == 0:
-            mp3_file = output_template.replace('.%(ext)s', '.mp3')
-            if os.path.exists(mp3_file):
-                # ファイルサイズをチェック
-                file_size = os.path.getsize(mp3_file) / (1024 * 1024)  # MB
-                print(f"📦 ダウンロード成功: {mp3_file} ({file_size:.1f}MB)")
-                return mp3_file
-        return None
-        
-    except Exception as e:
-        print(f"ダウンロードエラー: {e}")
-        return None
-
-def search_and_process(user_id, song_name):
-    """検索とダウンロード処理のメイン関数"""
-    try:
-        line_bot_api.push_message(user_id, TextSendMessage(text="🔍 YouTubeを検索中..."))
-        
-        # YouTube検索
-        video_info = search_youtube(song_name)
-        if not video_info:
-            line_bot_api.push_message(user_id, TextSendMessage(text="❌ 曲が見つかりませんでした"))
-            return
-        
-        # 動画情報を表示
-        duration = video_info['duration']
-        mins, secs = divmod(duration, 60)
-        line_bot_api.push_message(
-            user_id, 
-            TextSendMessage(
-                text=f"✅ 見つかりました！\n"
-                     f"タイトル: {video_info['title']}\n"
-                     f"アーティスト: {video_info['uploader']}\n"
-                     f"長さ: {mins}分{secs}秒\n\n"
-                     f"📥 MP3をダウンロード中..."
-            )
-        )
-        
-        # MP3ダウンロード
-        mp3_file = download_audio(video_info['url'])
-        if not mp3_file:
-            line_bot_api.push_message(user_id, TextSendMessage(text="❌ MP3のダウンロードに失敗しました"))
-            return
-        
-        line_bot_api.push_message(user_id, TextSendMessage(text="☁️ Dropboxにアップロード中..."))
-        
-        # Dropboxにアップロード
-        file_name = f"{video_info['title']}.mp3"
-        dropbox_link = upload_to_dropbox(mp3_file, file_name)
-        
-        # 一時ファイルを削除
-        try:
-            os.unlink(mp3_file)
-            print(f"🗑️ 一時ファイル削除: {mp3_file}")
-        except Exception as e:
-            print(f"ファイル削除エラー: {e}")
-        
-        if dropbox_link:
-            # 成功メッセージ
-            line_bot_api.push_message(
-                user_id,
-                TextSendMessage(
-                    text=f"🎉 MP3の準備が完了しました！\n\n"
-                         f"📁 ファイル名: {video_info['title']}.mp3\n"
-                         f"🔗 ダウンロードリンク:\n"
-                         f"{dropbox_link}\n\n"
-                         f"※ リンクをタップしてダウンロードしてください"
-                )
-            )
-        else:
-            line_bot_api.push_message(
-                user_id,
-                TextSendMessage(text="❌ Dropboxへのアップロードに失敗しました")
-            )
+        # 一時ディレクトリで処理
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # MP3をダウンロード
+            mp3_path = download_audio(video_url, song_name, temp_dir, job_id)
+            
+            if not mp3_path:
+                raise Exception("MP3のダウンロードに失敗しました")
+            
+            # ファイルサイズを確認
+            file_size = os.path.getsize(mp3_path)
+            jobs_db[job_id].update({
+                "progress": "ダウンロード完了",
+                "file_size": f"{file_size / 1024 / 1024:.1f}MB"
+            })
+            
+            # ここでファイルを永続ストレージにアップロード
+            # 一時的にダウンロードURLを生成（Railwayの特性上）
+            download_url = create_temporary_download(mp3_path, song_name, job_id)
+            
+            # 完了ステータスを更新
+            jobs_db[job_id].update({
+                "status": "completed",
+                "progress": "完了",
+                "download_url": download_url,
+                "completed_at": datetime.now().isoformat(),
+                "file_name": f"{sanitize_filename(song_name)}.mp3"
+            })
+            
+            logger.info(f"変換完了: {job_id} - {song_name}")
             
     except Exception as e:
-        print(f"処理エラー: {e}")
-        line_bot_api.push_message(
-            user_id,
-            TextSendMessage(text="😢 エラーが発生しました。しばらくしてから再度お試しください")
-        )
+        logger.error(f"変換処理エラー {job_id}: {str(e)}")
+        jobs_db[job_id].update({
+            "status": "failed",
+            "progress": "エラー",
+            "error": str(e),
+            "failed_at": datetime.now().isoformat()
+        })
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Server starting on port {port}")
-    print(f"✅ LINE_TOKEN: {'設定済み' if LINE_CHANNEL_ACCESS_TOKEN else '未設定'}")
-    print(f"✅ DROPBOX_TOKEN: {'設定済み' if DROPBOX_ACCESS_TOKEN else '未設定'}")
-    app.run(host='0.0.0.0', port=port)
+def download_audio(video_url, song_name, output_dir, job_id):
+    """yt-dlpで音声をダウンロード"""
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': os.path.join(output_dir, f'{sanitize_filename(song_name)}.%(ext)s'),
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'quiet': False,
+        'no_warnings': False,
+        'progress_hooks': [lambda d: progress_hook(d, job_id)],
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # 情報を取得（ダウンロード前）
+            info = ydl.extract_info(video_url, download=False)
+            jobs_db[job_id].update({
+                "video_title": info.get('title', '不明'),
+                "duration": info.get('duration', 0)
+            })
+            
+            # ダウンロード実行
+            ydl.download([video_url])
+            
+            # 生成されたファイルパスを探す
+            expected_path = os.path.join(output_dir, f"{sanitize_filename(song_name)}.mp3")
+            if os.path.exists(expected_path):
+                return expected_path
+            else:
+                # ファイルが見つからない場合、ディレクトリ内を検索
+                for file in os.listdir(output_dir):
+                    if file.endswith('.mp3'):
+                        return os.path.join(output_dir, file)
+                return None
+                
+    except Exception as e:
+        logger.error(f"ダウンロードエラー: {str(e)}")
+        raise e
 
+def progress_hook(d, job_id):
+    """進捗状況を更新"""
+    if d['status'] == 'downloading':
+        jobs_db[job_id]['progress'] = f"ダウンロード中: {d.get('_percent_str', '0%')}"
+    elif d['status'] == 'processing':
+        jobs_db[job_id]['progress'] = "MP3に変換中"
+
+def create_temporary_download(file_path, song_name, job_id):
+    """一時的なダウンロード方法（本番ではGoogle Drive等に変更）"""
+    # 注意: Railwayはエフェメラルストレージなので、実際のプロダクションでは
+    # Google Drive, S3, または永続ストレージを使用してください
+    
+    # ここではファイル情報を返すだけ（実際のダウンロードは別途実装）
+    file_size = os.path.getsize(file_path)
+    return {
+        "note": "ファイルはサーバー上に一時保存されています",
+        "file_name": f"{sanitize_filename(song_name)}.mp3",
+        "file_size": file_size,
+        "job_id": job_id,
+        "action": "contact_admin_for_download"
+    }
+
+def sanitize_filename(filename):
+    """安全なファイル名に変換"""
+    import re
+    # 危険な文字を除去
+    cleaned = re.sub(r'[<>:"/\\|?*]', '', filename)
+    # スペースをアンダースコアに
+    cleaned = re.sub(r'\s+', '_', cleaned)
+    # 長さ制限
+    return cleaned[:50]
+
+def generate_job_id(song_name):
+    """一意のジョブIDを生成"""
+    import hashlib
+    import time
+    unique_string = f"{song_name}{time.time_ns()}"
+    return hashlib.md5(unique_string.encode()).hexdigest()[:12]
+
+@app.route('/api/status/<job_id>', methods=['GET'])
+def get_status(job_id):
+    """ジョブステータスを取得"""
+    job = jobs_db.get(job_id)
+    
+    if not job:
+        return jsonify({
+            "success": False,
+            "error": "ジョブが見つかりません"
+        }), 404
+    
+    return jsonify({
+        "success": True,
+        "jobId": job_id,
+        **job
+    })
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """ヘルスチェック"""
+    return jsonify({
+        "status": "healthy",
+        "service": "MP3 Converter API",
+        "timestamp": datetime.now().isoformat(),
+        "active_jobs": len([j for j in jobs_db.values() if j['status'] == 'processing'])
+    })
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
