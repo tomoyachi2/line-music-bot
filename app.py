@@ -7,14 +7,12 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-from pyngrok import ngrok
 
 app = Flask(__name__)
 
-# LINEの設定（後で変更します）
-LINE_CHANNEL_ACCESS_TOKEN = "YOUR_ACCESS_TOKEN_HERE"
-LINE_CHANNEL_SECRET = "YOUR_CHANNEL_SECRET_HERE"
-
+# LINEの設定
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
@@ -170,4 +168,5 @@ if __name__ == "__main__":
     print("=" * 50)
     print("\nこのURLをLINE Developersに設定してください")
     
+
     app.run(host='0.0.0.0', port=5000, debug=False)
