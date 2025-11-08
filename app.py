@@ -147,3 +147,79 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 Server starting on port {port}")
     app.run(host='0.0.0.0', port=port)
+
+import dropbox
+from dropbox.exceptions import AuthError
+
+def get_dropbox_client():
+    """Dropboxクライアントを取得"""
+    try:
+        access_token = os.environ.get('DROPBOX_ACCESS_TOKEN')
+        if not access_token:
+            print("❌ Dropboxアクセストークンが設定されていません")
+            return None
+        return dropbox.Dropbox(access_token)
+    except Exception as e:
+        print(f"Dropbox接続エラー: {e}")
+        return None
+
+def upload_to_dropbox(file_path, file_name):
+    """Dropboxにアップロードして共有リンクを生成"""
+    try:
+        dbx = get_dropbox_client()
+        if not dbx:
+            return None
+        
+        # ファイル名を安全な形式に
+        safe_name = "".join(c for c in file_name if c.isalnum() or c in (' ', '-', '_', '.')).rstrip()
+        
+        # Dropboxにアップロード
+        with open(file_path, 'rb') as f:
+            result = dbx.files_upload(
+                f.read(),
+                f'/{safe_name}',
+                mode=dropbox.files.WriteMode.overwrite
+            )
+        
+        print(f"✅ Dropboxアップロード成功: {safe_name}")
+        
+        # 共有リンクを作成
+        shared_link = dbx.sharing_create_shared_link(result.path_display)
+        return shared_link.url
+        
+    except AuthError as e:
+        print(f"Dropbox認証エラー: {e}")
+        return None
+    except Exception as e:
+        print(f"Dropboxアップロードエラー: {e}")
+        return None
+
+def download_audio(video_url):
+    """YouTubeから音声をダウンロード"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
+            output_template = tmp_file.name.replace('.mp3', '.%(ext)s')
+        
+        cmd = [
+            'yt-dlp',
+            '-x',
+            '--audio-format', 'mp3', 
+            '--audio-quality', '0',
+            '--no-overwrites',
+            '--quiet',
+            '-o', output_template,
+            video_url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0:
+            mp3_file = output_template.replace('.%(ext)s', '.mp3')
+            if os.path.exists(mp3_file):
+                return mp3_file
+        return None
+        
+    except Exception as e:
+        print(f"ダウンロードエラー: {e}")
+        return None
+
