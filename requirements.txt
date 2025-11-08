@@ -1,0 +1,4 @@
+flask==2.3.3
+line-bot-sdk==2.4.1
+yt-dlp==2023.11.16
+gunicorn==21.2.0
